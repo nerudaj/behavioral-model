@@ -14,30 +14,28 @@
  */
 
 /*
- * Antonin Bas (antonin@barefootnetworks.com)
+ * Jakub Neruda (xnerud01@stud.fit.vutbr.cz)
  *
  */
 
-#include <bm/bm_sim/_assert.h>
-
+#include <PI/p4info.h>
+#include <PI/pi.h>
 #include <PI/target/pi_learn_imp.h>
+#include "helpers.hpp"
 
 extern "C" {
 
-pi_status_t _pi_learn_msg_ack(pi_session_handle_t session_handle,
-                              pi_dev_id_t dev_id,
-                              pi_p4_id_t learn_id,
-                              pi_learn_msg_id_t msg_id) {
-  _BM_UNUSED(session_handle);
-  _BM_UNUSED(dev_id);
-  _BM_UNUSED(learn_id);
-  _BM_UNUSED(msg_id);
-  return PI_STATUS_NOT_IMPLEMENTED_BY_TARGET;
+pi_status_t _pi_learn_msg_ack(pi_session_handle_t session_handle, pi_dev_id_t dev_id, pi_p4_id_t learn_id, pi_learn_msg_id_t msg_id) {
+	COMBO_UNUNSED(session_handle);
+	COMBO_UNUNSED(dev_id);
+	COMBO_UNUNSED(learn_id);
+	COMBO_UNUNSED(msg_id);
+	return PI_STATUS_NOT_IMPLEMENTED_BY_TARGET;
 }
 
 pi_status_t _pi_learn_msg_done(pi_learn_msg_t *msg) {
-  _BM_UNUSED(msg);
-  return PI_STATUS_NOT_IMPLEMENTED_BY_TARGET;
+	COMBO_UNUNSED(msg);
+	return PI_STATUS_NOT_IMPLEMENTED_BY_TARGET;
 }
 
 }

@@ -14,885 +14,628 @@
  */
 
 /*
- * Antonin Bas (antonin@barefootnetworks.com)
+ * Jakub Neruda (xnerud01@stud.fit.vutbr.cz)
  *
  */
-
-#include <bm/bm_sim/_assert.h>
-#include <bm/bm_sim/switch.h>
 
 #include <PI/int/pi_int.h>
 #include <PI/int/serialize.h>
 #include <PI/p4info.h>
 #include <PI/pi.h>
-
-#include <algorithm>
-#include <limits>
-#include <string>
-#include <vector>
-
+#include <p4dev.h>
 #include <cstring>
+#include "devices.hpp"
+#include "helpers.hpp"
+#include "logger.hpp"
 
-#include "action_helpers.h"
-#include "direct_res_spec.h"
-#include "common.h"
+p4rule_t *createRule(const char *tableName, const pi_p4info_t *info, pi_p4_id_t table_id) {
+	std::size_t matchFieldsSize = pi_p4info_table_num_match_fields(info, table_id);
 
-namespace {
+	// Determine engine of rule
+	p4engine_type_t engineType = P4ENGINE_UNKNOWN;
+	for (std::size_t i = 0; i < matchFieldsSize; i++) {
+		auto finfo = pi_p4info_table_match_field_info(info, table_id, i);
+		if (engineType == P4ENGINE_UNKNOWN) engineType = translateEngine(finfo->match_type);
+		else if (engineType != translateEngine(finfo->match_type)) return NULL;
+	}
+	if (engineType == P4ENGINE_UNKNOWN) return NULL;
 
-// We check which of pi_priority_t (PI type) and int (bmv2 type) can fit the
-// largest unsigned integer. If it is priority_t, BM_MAX_PRIORITY is set to the
-// max value for an int. If it is int, BM_MAX_PRIORITY is set to the max value
-// for a priority_t. BM_MAX_PRIORITY is then used as a pivot to invert priority
-// values passed by PI.
-static constexpr pi_priority_t BM_MAX_PRIORITY =
-    (static_cast<uintmax_t>(std::numeric_limits<pi_priority_t>::max()) >=
-     static_cast<uintmax_t>(std::numeric_limits<int>::max())) ?
-    static_cast<pi_priority_t>(std::numeric_limits<int>::max()) :
-    std::numeric_limits<pi_priority_t>::max();
-
-class PriorityInverter {
- public:
-  PriorityInverter() = delete;
-  static int pi_to_bm(pi_priority_t from) {
-    assert(from <= BM_MAX_PRIORITY);
-    return BM_MAX_PRIORITY - from;
-  }
-  static pi_priority_t bm_to_pi(int from) {
-    assert(from >= 0 && static_cast<uintmax_t>(from) <= BM_MAX_PRIORITY);
-    return BM_MAX_PRIORITY - static_cast<pi_priority_t>(from);
-  }
-};
-
-std::vector<bm::MatchKeyParam> build_key(pi_p4_id_t table_id,
-                                         const pi_match_key_t *match_key,
-                                         const pi_p4info_t *p4info,
-                                         int *priority) {
-  std::vector<bm::MatchKeyParam> key;
-  *priority = 0;
-
-  const char *mk_data = match_key->data;
-
-  size_t num_match_fields = pi_p4info_table_num_match_fields(p4info, table_id);
-  key.reserve(num_match_fields);
-  for (size_t i = 0; i < num_match_fields; i++) {
-    auto finfo = pi_p4info_table_match_field_info(p4info, table_id, i);
-    size_t f_bw = finfo->bitwidth;
-    size_t nbytes = (f_bw + 7) / 8;
-
-    switch (finfo->match_type) {
-      case PI_P4INFO_MATCH_TYPE_VALID:
-        key.emplace_back(
-            bm::MatchKeyParam::Type::VALID,
-            (*mk_data != 0) ? std::string("\x01", 1) : std::string("\x00", 1));
-        mk_data++;
-        break;
-      case PI_P4INFO_MATCH_TYPE_EXACT:
-        key.emplace_back(bm::MatchKeyParam::Type::EXACT,
-                         std::string(mk_data, nbytes));
-        mk_data += nbytes;
-        break;
-      case PI_P4INFO_MATCH_TYPE_LPM:
-        {
-          std::string k(mk_data, nbytes);
-          mk_data += nbytes;
-          uint32_t pLen;
-          mk_data += retrieve_uint32(mk_data, &pLen);
-          key.emplace_back(bm::MatchKeyParam::Type::LPM, k, pLen);
-        }
-        break;
-      case PI_P4INFO_MATCH_TYPE_TERNARY:
-        {
-          std::string k(mk_data, nbytes);
-          mk_data += nbytes;
-          std::string mask(mk_data, nbytes);
-          mk_data += nbytes;
-          key.emplace_back(bm::MatchKeyParam::Type::TERNARY, k, mask);
-        }
-        *priority = PriorityInverter::pi_to_bm(match_key->priority);
-        break;
-      case PI_P4INFO_MATCH_TYPE_RANGE:
-        {
-          std::string start(mk_data, nbytes);
-          mk_data += nbytes;
-          std::string end(mk_data, nbytes);
-          mk_data += nbytes;
-          key.emplace_back(bm::MatchKeyParam::Type::RANGE, start, end);
-        }
-        *priority = PriorityInverter::pi_to_bm(match_key->priority);
-        break;
-      default:
-        assert(0);
-    }
-  }
-
-  return key;
+	p4rule_t *result = p4rule_create(tableName, engineType);
+	return result;
 }
 
-class bm_exception : public std::exception {
- public:
-  explicit bm_exception(bm::MatchErrorCode error_code)
-      : error_code(error_code) { }
+uint32_t createKeys(const pi_p4info_t *info, pi_p4_id_t table_id, const pi_match_key_t *match_key, p4key_elem_t **key) {
+	const char *data = match_key->data;
 
-  const char* what() const noexcept override {
-    return "bm_exception";
-  }
+	uint8_t *value;
+	uint8_t *mask;
+	uint32_t status;
 
-  pi_status_t get() const noexcept {
-    return pibmv2::convert_error_code(error_code);
-  }
+	p4key_elem_t *last = NULL;
 
- private:
-  bm::MatchErrorCode error_code;
-};
+	size_t matchFieldsSize = pi_p4info_table_num_match_fields(info, table_id);
+	for (std::size_t i = 0; i < matchFieldsSize; i++) {
+		const pi_p4info_match_field_info_t *fieldInfo = pi_p4info_table_match_field_info(info, table_id, i);
+		size_t bitwidth = fieldInfo->bitwidth;
+		size_t bytewidth = (bitwidth + 7) / 8;
+		uint32_t prefixLen;
+		const char *keyName = pi_p4info_table_match_field_name_from_id(info, table_id, fieldInfo->mf_id);
 
-pi_entry_handle_t add_entry(const pi_p4info_t *p4info,
-                            pi_dev_tgt_t dev_tgt,
-                            const std::string &t_name,
-                            std::vector<bm::MatchKeyParam> &&match_key,
-                            int priority,
-                            const pi_action_data_t *adata) {
-  _BM_UNUSED(dev_tgt);
-  auto action_data = pibmv2::build_action_data(adata, p4info);
-  pi_p4_id_t action_id = adata->action_id;
-  std::string a_name(pi_p4info_action_name_from_id(p4info, action_id));
-  bm::entry_handle_t entry_handle;
-  auto error_code = pibmv2::switch_->mt_add_entry(
-      0, t_name, std::move(match_key), a_name,
-      std::move(action_data), &entry_handle, priority);
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    throw bm_exception(error_code);
-  return static_cast<pi_entry_handle_t>(entry_handle);
+		switch (fieldInfo->match_type) {
+		case PI_P4INFO_MATCH_TYPE_VALID:
+			return P4DEV_NOT_IMPLEMENTED;
+			break;
+
+		case PI_P4INFO_MATCH_TYPE_EXACT:
+			value = new uint8_t[bytewidth];
+			if (value == NULL) return P4DEV_ALLOCATE_ERROR;
+			memcpy(value, data, bytewidth);
+			data += bytewidth;
+			
+			/* NOTE:
+				P4 Runtime treats data as-is, meaning that IPv4 written as
+				1.2.3.4 will be saved in uint8_t array as [1,2,3,4]. But
+				lip4dev expects data to be ordered as [4,3,2,1]. That is
+				why we have to flip the endianness.
+			 */
+			flipEndianness(value, bytewidth);
+
+			if (last == NULL) {
+				(*key) = p4key_exact_create(keyName, bytewidth, value);
+				last = *key;
+			}
+			else {
+				last->next = p4key_exact_create(keyName, bytewidth, value);
+				last = last->next;
+			}
+			break;
+
+		case PI_P4INFO_MATCH_TYPE_LPM:
+			value = new uint8_t[bytewidth];
+			if (value == NULL) return P4DEV_ALLOCATE_ERROR;
+			memcpy(value, data, bytewidth);
+			data += bytewidth;
+			data += retrieve_uint32(data, &prefixLen);
+			flipEndianness(value, bytewidth);
+
+			if (last == NULL) {
+				(*key) = p4key_lpm_create(keyName, bytewidth, value, prefixLen);
+				last = *key;
+			}
+			else {
+				last->next = p4key_lpm_create(keyName, bytewidth, value, prefixLen);
+				last = last->next;
+			}
+			break;
+
+		case PI_P4INFO_MATCH_TYPE_TERNARY:
+			value = new uint8_t[bytewidth];
+			mask = new uint8_t[bytewidth];
+
+			if (value == NULL or mask == NULL) return P4DEV_ALLOCATE_ERROR;
+
+			memcpy(value, data, bytewidth);
+			data += bytewidth;
+			flipEndianness(value, bytewidth);
+			memcpy(mask, data, bytewidth);
+			data += bytewidth;
+			flipEndianness(mask, bytewidth);
+
+			if (last == NULL) {
+				(*key) = p4key_ternary_create(keyName, bytewidth, value, mask);
+				last = *key;
+			}
+			else {
+				last->next = p4key_ternary_create(keyName, bytewidth, value, mask);
+				last = last->next;
+			}
+
+			//*requires_priority = true;
+			break;
+
+		case PI_P4INFO_MATCH_TYPE_RANGE:
+			return P4DEV_NOT_IMPLEMENTED;
+			break;
+
+		default:
+			assert(0);
+			break;
+		}
+	}
+
+	return P4DEV_OK;
 }
 
-pi_entry_handle_t add_indirect_entry(const pi_p4info_t *p4info,
-                                     pi_dev_tgt_t dev_tgt,
-                                     const std::string &t_name,
-                                     std::vector<bm::MatchKeyParam> &&match_key,
-                                     int priority,
-                                     pi_indirect_handle_t h) {
-  _BM_UNUSED(p4info);  // needed later?
-  _BM_UNUSED(dev_tgt);
-  bm::entry_handle_t entry_handle;
-  bool is_grp_h = pibmv2::IndirectHMgr::is_grp_h(h);
-  bm::MatchErrorCode error_code;
-  if (!is_grp_h) {
-    error_code = pibmv2::switch_->mt_indirect_add_entry(
-        0, t_name, std::move(match_key), h, &entry_handle, priority);
-  } else {
-    h = pibmv2::IndirectHMgr::clear_grp_h(h);
-    error_code = pibmv2::switch_->mt_indirect_ws_add_entry(
-        0, t_name, std::move(match_key), h, &entry_handle, priority);
-  }
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    throw bm_exception(error_code);
-  return static_cast<pi_entry_handle_t>(entry_handle);
+uint32_t addKeys(const pi_p4info_t *info, pi_p4_id_t table_id, const pi_match_key_t *match_key, p4rule_t *rule) {
+	p4key_elem_t *key;
+	uint32_t status;
+	if ((status = createKeys(info, table_id, match_key, &key)) != P4DEV_OK) {
+		return status;
+	}
+
+	if ((status = p4rule_add_key_element(rule, key)) != P4DEV_OK) return status;
+
+	return P4DEV_OK;
 }
 
-void set_default_entry(const pi_p4info_t *p4info,
-                       pi_dev_tgt_t dev_tgt,
-                       const std::string &t_name,
-                       const pi_action_data_t *adata) {
-  _BM_UNUSED(dev_tgt);
-  auto action_data = pibmv2::build_action_data(adata, p4info);
-  pi_p4_id_t action_id = adata->action_id;
-  std::string a_name(pi_p4info_action_name_from_id(p4info, action_id));
-  auto error_code = pibmv2::switch_->mt_set_default_action(
-      0, t_name, a_name, std::move(action_data));
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    throw bm_exception(error_code);
+uint32_t createParams(const pi_p4info_t *info, const pi_p4_id_t actionID, const char *actionData, p4param_t **param) {
+	assert(info != NULL);
+	assert(actionData != NULL);
+	assert(param != NULL);
+	assert(*param == NULL);
+
+	uint32_t status;
+	p4param_t *last = NULL;
+	size_t paramIdsSize;
+	const pi_p4_id_t *paramIds = pi_p4info_action_get_params(info, actionID, &paramIdsSize);
+	for (size_t i = 0; i < paramIdsSize; i++) {
+		size_t paramBitwidth = pi_p4info_action_param_bitwidth(info, actionID, paramIds[i]);
+		size_t paramBytewidth = (paramBitwidth + 7) / 8;
+
+		uint8_t *data = new uint8_t[paramBytewidth];
+		if (data == NULL) return P4DEV_ALLOCATE_ERROR;
+
+		memcpy(data, actionData, paramBytewidth);
+		flipEndianness(data, paramBytewidth); // Everything that is a byte array has to be flipped
+		const char *paramName = pi_p4info_action_param_name_from_id(info, actionID, paramIds[i]);
+
+		if (*param == NULL) {
+			*param = p4param_create(paramName, paramBytewidth, data);
+			if (*param == NULL) return P4DEV_ALLOCATE_ERROR;
+			last = *param;
+		}
+		else {
+			last->next = p4param_create(paramName, paramBytewidth, data);
+			if (last->next == NULL) return P4DEV_ALLOCATE_ERROR;
+			last = last->next;
+		}
+
+		actionData += paramBytewidth;
+	}
+
+	return P4DEV_OK;
 }
 
-void set_default_indirect_entry(const pi_p4info_t *p4info,
-                                pi_dev_tgt_t dev_tgt,
-                                const std::string &t_name,
-                                pi_indirect_handle_t h) {
-  _BM_UNUSED(p4info);  // needed later?
-  _BM_UNUSED(dev_tgt);
-  bool is_grp_h = pibmv2::IndirectHMgr::is_grp_h(h);
-  bm::MatchErrorCode error_code;
-  if (!is_grp_h) {
-    error_code = pibmv2::switch_->mt_indirect_set_default_member(
-        0, t_name, h);
-  } else {
-    h = pibmv2::IndirectHMgr::clear_grp_h(h);
-    error_code = pibmv2::switch_->mt_indirect_ws_set_default_group(
-        0, t_name, h);
-  }
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    throw bm_exception(error_code);
+uint32_t addAction(const pi_p4info_t *info, const pi_action_data_t *action_data, p4rule_t *rule) {
+	assert(info);
+	assert(action_data);
+
+	pi_p4_id_t actionID = action_data->action_id;
+	const char *actionData = action_data->data;
+	const char *actionName = pi_p4info_action_name_from_id(info, actionID);
+
+	uint32_t status;
+	if ((status = p4rule_add_action(rule, actionName)) != P4DEV_OK) return status;
+
+	p4param_t *params = NULL;
+	if ((status = createParams(info, actionID, actionData, &params)) != P4DEV_OK) return status;
+	
+	rule->params = params;
+
+	return P4DEV_OK;
 }
-
-void modify_entry(const pi_p4info_t *p4info,
-                  pi_dev_id_t dev_id,
-                  const std::string &t_name,
-                  pi_entry_handle_t entry_handle,
-                  const pi_action_data_t *adata) {
-  _BM_UNUSED(dev_id);
-  auto action_data = pibmv2::build_action_data(adata, p4info);
-  pi_p4_id_t action_id = adata->action_id;
-  std::string a_name(pi_p4info_action_name_from_id(p4info, action_id));
-  auto error_code = pibmv2::switch_->mt_modify_entry(
-      0, t_name, entry_handle, a_name, std::move(action_data));
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    throw bm_exception(error_code);
-}
-
-void modify_indirect_entry(const pi_p4info_t *p4info,
-                           pi_dev_id_t dev_id,
-                           const std::string &t_name,
-                           pi_entry_handle_t entry_handle,
-                           pi_indirect_handle_t h) {
-  _BM_UNUSED(p4info);  // needed later?
-  _BM_UNUSED(dev_id);
-  bool is_grp_h = pibmv2::IndirectHMgr::is_grp_h(h);
-  bm::MatchErrorCode error_code;
-  if (!is_grp_h) {
-    error_code = pibmv2::switch_->mt_indirect_modify_entry(
-        0, t_name, entry_handle, h);
-  } else {
-    h = pibmv2::IndirectHMgr::clear_grp_h(h);
-    error_code = pibmv2::switch_->mt_indirect_ws_modify_entry(
-        0, t_name, entry_handle, h);
-  }
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    throw bm_exception(error_code);
-}
-
-template <typename E>
-void build_action_entry(const pi_p4info_t *p4info, const E &entry,
-                        pi_table_entry_t *table_entry);
-
-template <>
-void build_action_entry<bm::MatchTable::Entry>(
-    const pi_p4info_t *p4info, const bm::MatchTable::Entry &entry,
-    pi_table_entry_t *table_entry) {
-  table_entry->entry_type = PI_ACTION_ENTRY_TYPE_DATA;
-
-  const pi_p4_id_t action_id = pi_p4info_action_id_from_name(
-      p4info, entry.action_fn->get_name().c_str());
-
-  const auto adata_size = pi_p4info_action_data_size(p4info, action_id);
-  // no alignment issue with new[]
-  char *data_ = new char[sizeof(pi_action_data_t) + adata_size];
-  pi_action_data_t *adata = reinterpret_cast<pi_action_data_t *>(data_);
-  data_ += sizeof(pi_action_data_t);
-  adata->p4info = p4info;
-  adata->action_id = action_id;
-  adata->data_size = adata_size;
-  adata->data = data_;
-  table_entry->entry.action_data = adata;
-  data_ = pibmv2::dump_action_data(p4info, data_, action_id, entry.action_data);
-}
-
-template <>
-void build_action_entry<bm::MatchTableIndirect::Entry>(
-    const pi_p4info_t *p4info, const bm::MatchTableIndirect::Entry &entry,
-    pi_table_entry_t *table_entry) {
-  _BM_UNUSED(p4info);
-  table_entry->entry_type = PI_ACTION_ENTRY_TYPE_INDIRECT;
-  auto indirect_handle = static_cast<pi_indirect_handle_t>(entry.mbr);
-  table_entry->entry.indirect_handle = indirect_handle;
-}
-
-template <>
-void build_action_entry<bm::MatchTableIndirectWS::Entry>(
-    const pi_p4info_t *p4info, const bm::MatchTableIndirectWS::Entry &entry,
-    pi_table_entry_t *table_entry) {
-  _BM_UNUSED(p4info);
-  table_entry->entry_type = PI_ACTION_ENTRY_TYPE_INDIRECT;
-  pi_indirect_handle_t indirect_handle;
-  if (entry.mbr < entry.grp) {
-    indirect_handle = static_cast<pi_indirect_handle_t>(entry.mbr);
-  } else {
-    indirect_handle = static_cast<pi_indirect_handle_t>(entry.grp);
-    indirect_handle = pibmv2::IndirectHMgr::make_grp_h(indirect_handle);
-  }
-  table_entry->entry.indirect_handle = indirect_handle;
-}
-
-template <typename M,
-          bm::MatchErrorCode (bm::RuntimeInterface::*GetFn)(
-              bm::cxt_id_t, const std::string &, typename M::Entry *) const>
-typename M::Entry get_default_entry_common(
-    const pi_p4info_t *p4info, const std::string &t_name,
-    pi_table_entry_t *table_entry) {
-  typename M::Entry entry;
-  auto error_code = std::bind(GetFn, pibmv2::switch_, 0, t_name, &entry)();
-  if (error_code == bm::MatchErrorCode::NO_DEFAULT_ENTRY) {
-    table_entry->entry_type = PI_ACTION_ENTRY_TYPE_NONE;
-  } else if (error_code != bm::MatchErrorCode::SUCCESS) {
-    throw bm_exception(error_code);
-  } else {
-    build_action_entry(p4info, entry, table_entry);
-  }
-  return entry;
-}
-
-void get_default_entry(const pi_p4info_t *p4info, const std::string &t_name,
-                       pi_table_entry_t *table_entry) {
-  switch (pibmv2::switch_->mt_get_type(0, t_name)) {
-    case bm::MatchTableType::NONE:
-      throw bm_exception(bm::MatchErrorCode::INVALID_TABLE_NAME);
-    case bm::MatchTableType::SIMPLE:
-      get_default_entry_common<
-        bm::MatchTable, &bm::RuntimeInterface::mt_get_default_entry>(
-            p4info, t_name, table_entry);
-      break;
-    case bm::MatchTableType::INDIRECT:
-      get_default_entry_common<
-        bm::MatchTableIndirect,
-        &bm::RuntimeInterface::mt_indirect_get_default_entry>(
-            p4info, t_name, table_entry);
-      break;
-    case bm::MatchTableType::INDIRECT_WS:
-      get_default_entry_common<
-        bm::MatchTableIndirectWS,
-        &bm::RuntimeInterface::mt_indirect_ws_get_default_entry>(
-            p4info, t_name, table_entry);
-      break;
-  }
-}
-
-using pibmv2::Buffer;
-
-// The difference with build_action_entry is the output format.
-template <typename E>
-void build_action_entry_2(const pi_p4info_t *p4info, const E &entry,
-                          Buffer *buffer);
-
-template <>
-void build_action_entry_2<bm::MatchTable::Entry>(
-    const pi_p4info_t *p4info, const bm::MatchTable::Entry &entry,
-    Buffer *buffer) {
-  emit_action_entry_type(buffer->extend(sizeof(s_pi_action_entry_type_t)),
-                         PI_ACTION_ENTRY_TYPE_DATA);
-
-  const pi_p4_id_t action_id = pi_p4info_action_id_from_name(
-      p4info, entry.action_fn->get_name().c_str());
-
-  const auto adata_size = pi_p4info_action_data_size(p4info, action_id);
-
-  emit_p4_id(buffer->extend(sizeof(s_pi_p4_id_t)), action_id);
-  emit_uint32(buffer->extend(sizeof(uint32_t)), adata_size);
-  if (adata_size > 0) {
-    pibmv2::dump_action_data(p4info, buffer->extend(adata_size), action_id,
-                             entry.action_data);
-  }
-}
-
-template <>
-void build_action_entry_2<bm::MatchTableIndirect::Entry>(
-    const pi_p4info_t *p4info, const bm::MatchTableIndirect::Entry &entry,
-    Buffer *buffer) {
-  _BM_UNUSED(p4info);
-  emit_action_entry_type(buffer->extend(sizeof(s_pi_action_entry_type_t)),
-                         PI_ACTION_ENTRY_TYPE_INDIRECT);
-  auto indirect_handle = static_cast<pi_indirect_handle_t>(entry.mbr);
-  emit_indirect_handle(buffer->extend(sizeof(s_pi_indirect_handle_t)),
-                       indirect_handle);
-}
-
-template <>
-void build_action_entry_2<bm::MatchTableIndirectWS::Entry>(
-    const pi_p4info_t *p4info, const bm::MatchTableIndirectWS::Entry &entry,
-    Buffer *buffer) {
-  _BM_UNUSED(p4info);
-  emit_action_entry_type(buffer->extend(sizeof(s_pi_action_entry_type_t)),
-                         PI_ACTION_ENTRY_TYPE_INDIRECT);
-  pi_indirect_handle_t indirect_handle;
-  if (entry.mbr < entry.grp) {
-    indirect_handle = static_cast<pi_indirect_handle_t>(entry.mbr);
-  } else {
-    indirect_handle = static_cast<pi_indirect_handle_t>(entry.grp);
-    indirect_handle = pibmv2::IndirectHMgr::make_grp_h(indirect_handle);
-  }
-  emit_indirect_handle(buffer->extend(sizeof(s_pi_indirect_handle_t)),
-                       indirect_handle);
-}
-
-template <
-  typename M,
-  typename std::vector<typename M::Entry> (bm::RuntimeInterface::*GetFn)(
-      bm::cxt_id_t, const std::string &) const>
-void get_entries_common(const pi_p4info_t *p4info, pi_p4_id_t table_id,
-                        pi_table_fetch_res_t *res) {
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
-
-  const auto entries = std::bind(GetFn, pibmv2::switch_, 0, t_name)();
-
-  res->num_entries = entries.size();
-  res->mkey_nbytes = pi_p4info_table_match_key_size(p4info, table_id);
-
-  size_t num_direct_resources;
-  auto *res_ids = pi_p4info_table_get_direct_resources(
-      p4info, table_id, &num_direct_resources);
-  // in bmv2, a table can have at most one direct counter and one direct meter
-  pi_p4_id_t counter_id = PI_INVALID_ID, meter_id = PI_INVALID_ID;
-  for (size_t i = 0; i < num_direct_resources; i++) {
-    if (pi_is_direct_counter_id(res_ids[i])) counter_id = res_ids[i];
-    if (pi_is_direct_meter_id(res_ids[i])) meter_id = res_ids[i];
-  }
-
-  Buffer buffer;
-  for (const auto &e : entries) {
-    emit_entry_handle(buffer.extend(sizeof(s_pi_entry_handle_t)), e.handle);
-    // TODO(antonin): temporary hack; for match types which do not require a
-    // priority, bmv2 returns -1, but the PI tends to expect 0, which is a
-    // problem for looking up entry state in the PI software. A better
-    // solution would be to ignore this value in the PI based on the key match
-    // type.
-    int priority = (e.priority == -1) ?
-        0 : PriorityInverter::bm_to_pi(e.priority);
-    emit_uint32(buffer.extend(sizeof(uint32_t)), priority);
-    for (const auto &p : e.match_key) {
-      switch (p.type) {
-        case bm::MatchKeyParam::Type::EXACT:
-          std::copy(p.key.begin(), p.key.end(), buffer.extend(p.key.size()));
-          break;
-        case bm::MatchKeyParam::Type::LPM:
-          std::copy(p.key.begin(), p.key.end(), buffer.extend(p.key.size()));
-          emit_uint32(buffer.extend(sizeof(uint32_t)), p.prefix_length);
-          break;
-        case bm::MatchKeyParam::Type::TERNARY:
-        case bm::MatchKeyParam::Type::RANGE:
-          std::copy(p.key.begin(), p.key.end(), buffer.extend(p.key.size()));
-          std::copy(p.mask.begin(), p.mask.end(), buffer.extend(p.mask.size()));
-          break;
-        case bm::MatchKeyParam::Type::VALID:
-          *buffer.extend(1) = (p.key == std::string("\x01", 1)) ? 1 : 0;
-          break;
-      }
-    }
-    build_action_entry_2(p4info, e, &buffer);
-
-    // properties
-    emit_uint32(buffer.extend(sizeof(uint32_t)), 0);
-
-    // direct resources
-    // the entry handle may not be valid any more by the time we query the
-    // direct resource configs, so we try to handle this case gracefully by not
-    // including the config in the buffer. A better solution may be to modify
-    // the bmv2 get_entries method to include the direct resource configs, but I
-    // am reluctant to change the interface at this stage.
-    {
-      bool valid_counter = false;
-      uint64_t bytes, packets;
-      if (counter_id != PI_INVALID_ID) {
-        auto error_code = pibmv2::switch_->mt_read_counters(
-            0, t_name, e.handle, &bytes, &packets);
-        valid_counter = (error_code == bm::MatchErrorCode::SUCCESS);
-      }
-      bool valid_meter = false;
-      std::vector<bm::Meter::rate_config_t> rates;
-      if (meter_id != PI_INVALID_ID) {
-        auto error_code = pibmv2::switch_->mt_get_meter_rates(
-            0, t_name, e.handle, &rates);
-        valid_meter = (error_code == bm::MatchErrorCode::SUCCESS);
-      }
-      size_t valid_direct = (valid_counter ? 1 : 0) + (valid_meter ? 1 : 0);
-      emit_uint32(buffer.extend(sizeof(uint32_t)), valid_direct);
-
-      if (valid_counter) {
-        PIDirectResMsgSizeFn msg_size_fn;
-        PIDirectResEmitFn emit_fn;
-        pi_direct_res_get_fns(
-            PI_DIRECT_COUNTER_ID, &msg_size_fn, &emit_fn, NULL, NULL);
-        emit_p4_id(buffer.extend(sizeof(s_pi_p4_id_t)), counter_id);
-        pi_counter_data_t counter_data;
-        pibmv2::convert_to_counter_data(&counter_data, bytes, packets);
-        auto msg_size = msg_size_fn(&counter_data);
-        emit_uint32(buffer.extend(sizeof(uint32_t)), msg_size);
-        emit_fn(buffer.extend(msg_size), &counter_data);
-      }
-      if (valid_meter) {
-        PIDirectResMsgSizeFn msg_size_fn;
-        PIDirectResEmitFn emit_fn;
-        pi_direct_res_get_fns(
-            PI_DIRECT_METER_ID, &msg_size_fn, &emit_fn, NULL, NULL);
-        emit_p4_id(buffer.extend(sizeof(s_pi_p4_id_t)), meter_id);
-        pi_meter_spec_t meter_spec;
-        pibmv2::convert_to_meter_spec(p4info, meter_id, &meter_spec, rates);
-        auto msg_size = msg_size_fn(&meter_spec);
-        emit_uint32(buffer.extend(sizeof(uint32_t)), msg_size);
-        emit_fn(buffer.extend(msg_size), &meter_spec);
-      }
-    }
-  }
-
-  res->entries_size = buffer.size();
-  res->entries = buffer.copy();
-}
-
-void get_entries(const pi_p4info_t *p4info, pi_p4_id_t table_id,
-                 pi_table_fetch_res_t *res) {
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
-
-  switch (pibmv2::switch_->mt_get_type(0, t_name)) {
-    case bm::MatchTableType::NONE:
-      throw bm_exception(bm::MatchErrorCode::INVALID_TABLE_NAME);
-    case bm::MatchTableType::SIMPLE:
-      get_entries_common<bm::MatchTable, &bm::RuntimeInterface::mt_get_entries>(
-          p4info, table_id, res);
-      break;
-    case bm::MatchTableType::INDIRECT:
-      get_entries_common<bm::MatchTableIndirect,
-                         &bm::RuntimeInterface::mt_indirect_get_entries>(
-                             p4info, table_id, res);
-      break;
-    case bm::MatchTableType::INDIRECT_WS:
-      get_entries_common<bm::MatchTableIndirectWS,
-                         &bm::RuntimeInterface::mt_indirect_ws_get_entries>(
-                             p4info, table_id, res);
-      break;
-  }
-}
-
-void set_direct_resources(const pi_p4info_t *p4info, pi_dev_id_t dev_id,
-                          const std::string &t_name,
-                          pi_entry_handle_t entry_handle,
-                          const pi_direct_res_config_t *direct_res_config) {
-  _BM_UNUSED(p4info);
-  _BM_UNUSED(dev_id);
-  if (!direct_res_config) return;
-  for (size_t i = 0; i < direct_res_config->num_configs; i++) {
-    pi_direct_res_config_one_t *config = &direct_res_config->configs[i];
-    pi_res_type_id_t type = PI_GET_TYPE_ID(config->res_id);
-    bm::MatchErrorCode error_code;
-    switch (type) {
-      case PI_DIRECT_COUNTER_ID:
-        {
-          uint64_t bytes, packets;
-          pibmv2::convert_from_counter_data(
-              reinterpret_cast<pi_counter_data_t *>(config->config),
-              &bytes, &packets);
-          error_code = pibmv2::switch_->mt_write_counters(
-              0, t_name, entry_handle, bytes, packets);
-        }
-        break;
-      case PI_DIRECT_METER_ID:
-        {
-          auto rates = pibmv2::convert_from_meter_spec(
-              reinterpret_cast<pi_meter_spec_t *>(config->config));
-          error_code = pibmv2::switch_->mt_set_meter_rates(
-              0, t_name, entry_handle, rates);
-        }
-        break;
-      default:  // TODO(antonin): what to do?
-        assert(0);
-        return;
-    }
-    if (error_code != bm::MatchErrorCode::SUCCESS)
-      throw bm_exception(error_code);
-  }
-}
-
-template <typename M,
-          bm::MatchErrorCode (bm::RuntimeInterface::*GetFn)(
-              bm::cxt_id_t, const std::string &,
-              const std::vector<bm::MatchKeyParam> &,
-              typename M::Entry *, int) const>
-pi_entry_handle_t get_entry_handle_from_key_common(
-    pi_dev_id_t dev_id, const pi_p4info_t *p4info, pi_p4_id_t table_id,
-    const pi_match_key_t *match_key) {
-  _BM_UNUSED(dev_id);
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
-  int priority;
-  auto key = build_key(table_id, match_key, p4info, &priority);
-  typename M::Entry entry;
-  auto error_code = std::bind(
-      GetFn, pibmv2::switch_, 0, t_name, key, &entry, priority)();
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    throw bm_exception(error_code);
-  return entry.handle;
-}
-
-pi_entry_handle_t get_entry_handle_from_key(
-    pi_dev_id_t dev_id, pi_p4_id_t table_id, const pi_match_key_t *match_key) {
-  const auto *p4info = pibmv2::get_device_info(dev_id);
-  assert(p4info != nullptr);
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
-  switch (pibmv2::switch_->mt_get_type(0, t_name)) {
-    case bm::MatchTableType::NONE:
-      throw bm_exception(bm::MatchErrorCode::INVALID_TABLE_NAME);
-    case bm::MatchTableType::SIMPLE:
-      return get_entry_handle_from_key_common<
-        bm::MatchTable, &bm::RuntimeInterface::mt_get_entry_from_key>(
-            dev_id, p4info, table_id, match_key);
-    case bm::MatchTableType::INDIRECT:
-      return get_entry_handle_from_key_common<
-        bm::MatchTableIndirect,
-        &bm::RuntimeInterface::mt_indirect_get_entry_from_key>(
-            dev_id, p4info, table_id, match_key);
-    case bm::MatchTableType::INDIRECT_WS:
-      return get_entry_handle_from_key_common<
-        bm::MatchTableIndirectWS,
-        &bm::RuntimeInterface::mt_indirect_ws_get_entry_from_key>(
-            dev_id, p4info, table_id, match_key);
-  }
-  assert(0);  // unreachable
-  return 0;
-}
-
-}  // namespace
-
 
 extern "C" {
 
-pi_status_t _pi_table_entry_add(pi_session_handle_t session_handle,
-                                pi_dev_tgt_t dev_tgt,
-                                pi_p4_id_t table_id,
-                                const pi_match_key_t *match_key,
-                                const pi_table_entry_t *table_entry,
-                                int overwrite,
-                                pi_entry_handle_t *entry_handle) {
-  _BM_UNUSED(overwrite);  // TODO(antonin)
-  _BM_UNUSED(session_handle);
+//! Adds an entry to a table. Trying to add an entry that already exists should
+//! return an error, unless the \p overwrite flag is set.
+pi_status_t _pi_table_entry_add(pi_session_handle_t session_handle, pi_dev_tgt_t dev_tgt, pi_p4_id_t table_id, const pi_match_key_t *match_key, const pi_table_entry_t *table_entry, int overwrite, pi_entry_handle_t *entry_handle) {
+	(void) session_handle; ///< No support for sessions
+	Logger::debug("PI_table_entry_add");
+	
+	const pi_p4info_t *info = infos[dev_tgt.dev_id];
+	assert(info != NULL);
 
-  const auto *p4info = pibmv2::get_device_info(dev_tgt.dev_id);
-  assert(p4info != nullptr);
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_tgt.dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
+	
+	// Initialize rule object
+	p4rule_t *rule = createRule(tableName, info, table_id);
+	if (rule == NULL) {
+		Logger::error("Cannot create rule\n");
+		return pi_status_t(PI_STATUS_TARGET_ERROR);
+	}
+	uint32_t status;
+	if ((status = addKeys(info, table_id, match_key, rule)) != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+	if ((status = addAction(info, table_entry->entry.action_data, rule)) != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+	
+	// Insert rule to table
+	uint32_t ruleIndex;
+	status = p4table_insert_rule(table, rule, &ruleIndex, overwrite);
+	if (status != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
 
-  if (match_key->priority > BM_MAX_PRIORITY)
-    return PI_STATUS_UNSUPPORTED_ENTRY_PRIORITY;
-  int priority;
-  auto mkey = build_key(table_id, match_key, p4info, &priority);
-
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
-
-  // TODO(antonin): entry timeout
-  try {
-    switch (table_entry->entry_type) {
-      case PI_ACTION_ENTRY_TYPE_DATA:
-        *entry_handle = add_entry(
-            p4info, dev_tgt, t_name, std::move(mkey), priority,
-            table_entry->entry.action_data);
-        break;
-      case PI_ACTION_ENTRY_TYPE_INDIRECT:
-        *entry_handle = add_indirect_entry(
-            p4info, dev_tgt, t_name, std::move(mkey), priority,
-            table_entry->entry.indirect_handle);
-        break;
-      default:
-        assert(0);
-    }
-    // direct resources
-    set_direct_resources(p4info, dev_tgt.dev_id, t_name, *entry_handle,
-                         table_entry->direct_res_config);
-  } catch (const bm_exception &e) {
-    return e.get();
-  }
-
-  return PI_STATUS_SUCCESS;
+	*entry_handle = ruleIndex;
+	
+	return PI_STATUS_SUCCESS;
 }
 
-pi_status_t _pi_table_default_action_set(pi_session_handle_t session_handle,
-                                         pi_dev_tgt_t dev_tgt,
-                                         pi_p4_id_t table_id,
-                                         const pi_table_entry_t *table_entry) {
-  _BM_UNUSED(session_handle);
+//! Sets the default entry for a table. Should return an error if the default
+//! entry was statically configured and set as const in the P4 program.
+pi_status_t _pi_table_default_action_set(pi_session_handle_t session_handle, pi_dev_tgt_t dev_tgt, pi_p4_id_t table_id, const pi_table_entry_t *table_entry) {
+	(void) session_handle;
+	Logger::debug("PI_table_default_action_set");
+	
+	const pi_p4info_t *info = infos[dev_tgt.dev_id];
+	assert(info != NULL);
 
-  const auto *p4info = pibmv2::get_device_info(dev_tgt.dev_id);
-  assert(p4info != nullptr);
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_tgt.dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
 
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
+	// Initialize rule object
+	p4rule_t *rule = p4table_get_rule_template(table); // There might not be match engine, no need to check it
+	if (rule == NULL) {
+		Logger::error("Cannot create rule\n");
+		return pi_status_t(PI_STATUS_TARGET_ERROR);
+	}
+	p4rule_mark_default(rule);
+	uint32_t status;
+	if ((status = addAction(info, table_entry->entry.action_data, rule)) != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
 
-  try {
-    if (table_entry->entry_type == PI_ACTION_ENTRY_TYPE_DATA) {
-      const pi_action_data_t *adata = table_entry->entry.action_data;
+	// Insert rule to table
+	status = p4table_insert_default_rule(table, rule);
+	if (status != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
 
-      // TODO(antonin): equivalent for indirect?
-      // TODO(antonin): move to common PI code?
-
-      if (pi_p4info_table_has_const_default_action(p4info, table_id)) {
-        bool has_mutable_action_params;
-        auto default_action_id = pi_p4info_table_get_const_default_action(
-            p4info, table_id, &has_mutable_action_params);
-        if (default_action_id != adata->action_id)
-          return PI_STATUS_CONST_DEFAULT_ACTION;
-        if (!has_mutable_action_params)
-          return PI_STATUS_CONST_DEFAULT_ACTION_NON_MUTABLE_PARAMS;
-      }
-
-      set_default_entry(p4info, dev_tgt, t_name, adata);
-    } else if (table_entry->entry_type == PI_ACTION_ENTRY_TYPE_INDIRECT) {
-      set_default_indirect_entry(p4info, dev_tgt, t_name,
-                                 table_entry->entry.indirect_handle);
-    } else {
-      assert(0);
-    }
-  } catch (const bm_exception &e) {
-    return e.get();
-  }
-
-  return PI_STATUS_SUCCESS;
+	return PI_STATUS_SUCCESS;
 }
 
-pi_status_t _pi_table_default_action_reset(pi_session_handle_t session_handle,
-                                           pi_dev_tgt_t dev_tgt,
-                                           pi_p4_id_t table_id) {
-  _BM_UNUSED(session_handle);
+//! Resets the default entry for a table, as previously set with
+//! pi_table_default_action_set, to the original default action (as specified in
+//! the P4 program).
+pi_status_t _pi_table_default_action_reset(pi_session_handle_t session_handle, pi_dev_tgt_t dev_tgt, pi_p4_id_t table_id) {
+	(void) session_handle;
+	Logger::debug("PI_table_default_action_reset");
 
-  const auto *p4info = pibmv2::get_device_info(dev_tgt.dev_id);
-  assert(p4info != nullptr);
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
+	const pi_p4info_t *info = infos[dev_tgt.dev_id];
+	assert(info != NULL);
 
-  bm::MatchErrorCode error_code = bm::MatchErrorCode::SUCCESS;
-  switch (pibmv2::switch_->mt_get_type(0, t_name)) {
-    case bm::MatchTableType::NONE:
-      error_code = bm::MatchErrorCode::INVALID_TABLE_NAME;
-      break;
-    case bm::MatchTableType::SIMPLE:
-      error_code = pibmv2::switch_->mt_reset_default_entry(0, t_name);
-      break;
-    case bm::MatchTableType::INDIRECT:
-    case bm::MatchTableType::INDIRECT_WS:
-      error_code = pibmv2::switch_->mt_indirect_reset_default_entry(0, t_name);
-      break;
-  }
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_tgt.dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
 
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    return pibmv2::convert_error_code(error_code);
-  return PI_STATUS_SUCCESS;
+	uint32_t status = p4table_reset_default_rule(table);
+	if (status != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	return PI_STATUS_SUCCESS;
 }
 
-pi_status_t _pi_table_default_action_get(pi_session_handle_t session_handle,
-                                         pi_dev_id_t dev_id,
-                                         pi_p4_id_t table_id,
-                                         pi_table_entry_t *table_entry) {
-  _BM_UNUSED(session_handle);
+//! Retrieve the default entry for a table.
+pi_status_t _pi_table_default_action_get(pi_session_handle_t session_handle, pi_dev_id_t dev_id, pi_p4_id_t table_id, pi_table_entry_t *table_entry) {
+	(void) session_handle;
+	Logger::debug("PI_table_default_action_get");
 
-  const auto *p4info = pibmv2::get_device_info(dev_id);
-  assert(p4info != nullptr);
+	const pi_p4info_t *info = infos[dev_id];
+	assert(info != NULL);
 
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
 
-  try {
-    get_default_entry(p4info, t_name, table_entry);
-  } catch (const bm_exception &e) {
-    return e.get();
-  }
+	p4rule_t *defaultRule = p4table_get_default_rule(table);
+	if (defaultRule == NULL) {
+		Logger::error("No default rule set");
+		return PI_STATUS_TARGET_ERROR;
+	}
 
-  return PI_STATUS_SUCCESS;
+	return retrieveEntry(info, defaultRule->action, defaultRule->params, table_entry);
 }
 
-pi_status_t _pi_table_default_action_done(pi_session_handle_t session_handle,
-                                          pi_table_entry_t *table_entry) {
-  _BM_UNUSED(session_handle);
+//! Need to be called after pi_table_default_action_get, once you wish the
+//! memory to be released.
+pi_status_t _pi_table_default_action_done(pi_session_handle_t session_handle, pi_table_entry_t *table_entry) {
+	(void) session_handle;
+	Logger::debug("PI_table_default_action_done");
 
-  if (table_entry->entry_type == PI_ACTION_ENTRY_TYPE_DATA) {
-    pi_action_data_t *action_data = table_entry->entry.action_data;
-    if (action_data) delete[] action_data;
-  }
+	if (table_entry->entry_type == PI_ACTION_ENTRY_TYPE_DATA) {
+		pi_action_data_t *action_data = table_entry->entry.action_data;
+		if (action_data) delete[] action_data;
+	}
 
-  return PI_STATUS_SUCCESS;
+	return PI_STATUS_SUCCESS;
 }
 
-pi_status_t _pi_table_entry_delete(pi_session_handle_t session_handle,
-                                   pi_dev_id_t dev_id,
-                                   pi_p4_id_t table_id,
-                                   pi_entry_handle_t entry_handle) {
-  _BM_UNUSED(session_handle);
+//! Delete an entry from a table using the entry handle. Should return an error
+//! if entry does not exist.
+pi_status_t _pi_table_entry_delete(pi_session_handle_t session_handle, pi_dev_id_t dev_id, pi_p4_id_t table_id, pi_entry_handle_t entry_handle) {
+	(void) session_handle;
+	Logger::debug("PI_table_entry_delete");
 
-  const auto *p4info = pibmv2::get_device_info(dev_id);
-  assert(p4info != nullptr);
+	const pi_p4info_t *info = infos[dev_id];
+	assert(info != NULL);
 
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
-  auto ap_id = pi_p4info_table_get_implementation(p4info, table_id);
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
 
-  auto error_code = (ap_id == PI_INVALID_ID) ?
-      pibmv2::switch_->mt_delete_entry(0, t_name, entry_handle) :
-      pibmv2::switch_->mt_indirect_delete_entry(0, t_name, entry_handle);
-  if (error_code != bm::MatchErrorCode::SUCCESS)
-    return pibmv2::convert_error_code(error_code);
-  return PI_STATUS_SUCCESS;
+	uint32_t status = p4table_delete_rule(table, entry_handle);
+	if (status != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	return PI_STATUS_SUCCESS;
 }
 
-// for the _wkey functions (delete and modify), we first retrieve the handle,
-// then call the "usual" method. We release the Thrift session lock in between
-// the 2, which may not be ideal. This can be improved later if needed.
+//! Delete an entry from a table using the match key. Should return an error
+//! if entry does not exist.
+pi_status_t _pi_table_entry_delete_wkey(pi_session_handle_t session_handle, pi_dev_id_t dev_id, pi_p4_id_t table_id, const pi_match_key_t *match_key) {
+	(void) session_handle;
+	Logger::debug("PI_table_entry_delete_wkey");
 
-pi_status_t _pi_table_entry_delete_wkey(pi_session_handle_t session_handle,
-                                        pi_dev_id_t dev_id, pi_p4_id_t table_id,
-                                        const pi_match_key_t *match_key) {
-  if (match_key->priority > BM_MAX_PRIORITY)
-    return PI_STATUS_UNSUPPORTED_ENTRY_PRIORITY;
-  try {
-    auto h = get_entry_handle_from_key(dev_id, table_id, match_key);
-    return _pi_table_entry_delete(session_handle, dev_id, table_id, h);
-  } catch (const bm_exception &e) {
-    return e.get();
-  }
+	const pi_p4info_t *info = infos[dev_id];
+	assert(info != NULL);
+
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
+
+	p4key_elem_t *key;
+	uint32_t status, index;
+	if ((status = createKeys(info, table_id, match_key, &key))) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	status = p4table_find_rule(table, key, &index);
+	if (status != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	status = p4table_delete_rule(table, index);
+	if (status != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	return PI_STATUS_SUCCESS;
 }
 
-pi_status_t _pi_table_entry_modify(pi_session_handle_t session_handle,
-                                   pi_dev_id_t dev_id,
-                                   pi_p4_id_t table_id,
-                                   pi_entry_handle_t entry_handle,
-                                   const pi_table_entry_t *table_entry) {
-  _BM_UNUSED(session_handle);
+//! Modify an existing entry using the entry handle. Should return an error if
+//! entry does not exist.
+pi_status_t _pi_table_entry_modify(pi_session_handle_t session_handle, pi_dev_id_t dev_id, pi_p4_id_t table_id, pi_entry_handle_t entry_handle, const pi_table_entry_t *table_entry) {
+	(void) session_handle;
+	Logger::debug("PI_table_entry_modify");
 
-  const auto *p4info = pibmv2::get_device_info(dev_id);
-  assert(p4info != nullptr);
+	const pi_p4info_t *info = infos[dev_id];
+	assert(info != NULL);
 
-  std::string t_name(pi_p4info_table_name_from_id(p4info, table_id));
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
 
-  try {
-    if (table_entry->entry_type == PI_ACTION_ENTRY_TYPE_DATA) {
-      modify_entry(p4info, dev_id, t_name, entry_handle,
-                   table_entry->entry.action_data);
-    } else if (table_entry->entry_type == PI_ACTION_ENTRY_TYPE_INDIRECT) {
-      modify_indirect_entry(p4info, dev_id, t_name, entry_handle,
-                            table_entry->entry.indirect_handle);
-    } else {
-      assert(0);
-    }
-    set_direct_resources(p4info, dev_id, t_name, entry_handle,
-                         table_entry->direct_res_config);
-  } catch (const bm_exception &e) {
-    return e.get();
-  }
+	pi_p4_id_t actionID = table_entry->entry.action_data->action_id;
+	const char *actionData = table_entry->entry.action_data->data;
+	const char *actionName = pi_p4info_action_name_from_id(info, actionID);
 
-  return PI_STATUS_SUCCESS;
+	p4param_t *params = NULL;
+	uint32_t status;
+	if ((status = createParams(info, actionID, actionData, &params)) != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	status = p4table_modify_rule(table, entry_handle, actionName, params);
+	if (status != P4DEV_OK)  {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	return PI_STATUS_SUCCESS;
 }
 
-pi_status_t _pi_table_entry_modify_wkey(pi_session_handle_t session_handle,
-                                        pi_dev_id_t dev_id, pi_p4_id_t table_id,
-                                        const pi_match_key_t *match_key,
-                                        const pi_table_entry_t *table_entry) {
-  if (match_key->priority > BM_MAX_PRIORITY)
-    return PI_STATUS_UNSUPPORTED_ENTRY_PRIORITY;
-  try {
-    auto h = get_entry_handle_from_key(dev_id, table_id, match_key);
-    return _pi_table_entry_modify(session_handle, dev_id, table_id, h,
-                                  table_entry);
-  } catch (const bm_exception &e) {
-    return e.get();
-  }
+//! Modify an existing entry using the match key. Should return an error if
+//! entry does not exist.
+pi_status_t _pi_table_entry_modify_wkey(pi_session_handle_t session_handle, pi_dev_id_t dev_id, pi_p4_id_t table_id, const pi_match_key_t *match_key, const pi_table_entry_t *table_entry) {
+	(void)session_handle;
+	Logger::debug("PI_table_entry_modify_wkey");
+
+	const pi_p4info_t *info = infos[dev_id];
+	assert(info != NULL);
+
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
+
+	uint32_t status, index;
+	p4key_elem_t *key;
+	if ((status = createKeys(info, table_id, match_key, &key)) != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	status = p4table_find_rule(table, key, &index);
+	if (status != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	pi_p4_id_t actionID = table_entry->entry.action_data->action_id;
+	const char *actionData = table_entry->entry.action_data->data;
+	const char *actionName = pi_p4info_action_name_from_id(info, actionID);
+
+	p4param_t *params = NULL;
+	if ((status = createParams(info, actionID, actionData, &params)) != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	status = p4table_modify_rule(table, index, actionName, params);
+	if (status != P4DEV_OK) {
+		p4dev_err_stderr(status);
+		return pi_status_t(PI_STATUS_TARGET_ERROR + status);
+	}
+
+	return PI_STATUS_SUCCESS;
 }
 
-pi_status_t _pi_table_entries_fetch(pi_session_handle_t session_handle,
-                                    pi_dev_id_t dev_id,
-                                    pi_p4_id_t table_id,
-                                    pi_table_fetch_res_t *res) {
-  _BM_UNUSED(session_handle);
+//! Retrieve all entries in table as one big blob.
+pi_status_t _pi_table_entries_fetch(pi_session_handle_t session_handle, pi_dev_id_t dev_id, pi_p4_id_t table_id, pi_table_fetch_res_t *res) {
+	(void) session_handle;
+	Logger::debug("PI_table_entries_fetch");
 
-  const auto *p4info = pibmv2::get_device_info(dev_id);
-  assert(p4info != nullptr);
+	const pi_p4info_t *info = infos[dev_id];
+	assert(info != NULL);
 
-  try {
-    get_entries(p4info, table_id, res);
-  } catch (const bm_exception &e) {
-    return e.get();
-  }
+	// Retrieve table handle
+	const char *tableName = pi_p4info_table_name_from_id(info, table_id);
+	p4table_t *table = p4device_get_table(&(devices[dev_id]), tableName);
+	if (table == NULL) {
+		Logger::error("Cannot get table with name: " + std::string(tableName));
+		return PI_STATUS_NETV_INVALID_OBJ_ID;
+	}
 
-  return PI_STATUS_SUCCESS;
+	res->num_entries = p4table_get_size(table);
+	size_t dataSize = 0U;
+	res->p4info = info;
+	res->num_direct_resources = res->num_entries;
+
+	dataSize += res->num_entries * sizeof(s_pi_entry_handle_t);
+	dataSize += res->num_entries * sizeof(s_pi_action_entry_type_t);
+	dataSize += res->num_entries * sizeof(uint32_t);  // for priority
+	dataSize += res->num_entries * sizeof(uint32_t);  // for properties
+	dataSize += res->num_entries * sizeof(uint32_t);  // for direct resources
+
+	res->mkey_nbytes = pi_p4info_table_match_key_size(info, table_id);
+	dataSize += res->num_entries * res->mkey_nbytes;
+
+	size_t num_actions;
+	auto actionIds = pi_p4info_table_get_actions(info, table_id, &num_actions);
+	auto actionMap = computeActionSizes(info, actionIds, num_actions);
+
+	for (uint32_t i = 0; i < res->num_entries; i++) {
+		auto *rule = p4table_get_rule(table, i);
+		
+		dataSize += actionMap.at(rule->action).size;
+		dataSize += sizeof(s_pi_p4_id_t); // Action ID
+		dataSize += sizeof(uint32_t); // Action params bytewidth
+	}
+
+	char *data = new char[dataSize];
+	if (data == NULL) return PI_STATUS_ALLOC_ERROR;
+
+	// in some cases, we do not use the whole buffer
+	std::fill(data, data + dataSize, 0);
+	res->entries_size = dataSize;
+	res->entries = data;
+
+	for (uint32_t i = 0; i < res->num_entries; i++) {
+		auto *rule = p4table_get_rule(table, i);
+
+		data += emit_entry_handle(data, i);
+		// We don't have priority yet
+		data += emit_uint32(data, 0); // priority
+
+		p4key_elem_t *key = rule->key;
+		while (key != NULL) {
+
+			switch (rule->engine) {
+			case P4ENGINE_TERNARY:
+				/* NOTE:
+					The endianness was flipped when the rule
+					was written into the device, now we have
+					to flip it back.
+				 */
+				flipEndianness(key->value, key->value_size);
+				std::memcpy(data, key->value, key->value_size);
+				data += key->value_size;
+				flipEndianness(key->opt.mask, key->value_size);
+				std::memcpy(data, key->opt.mask, key->value_size);
+				data += key->value_size;
+				break;
+
+			case P4ENGINE_LPM:
+				flipEndianness(key->value, key->value_size);
+				std::memcpy(data, key->value, key->value_size);
+				data += key->value_size;
+				data += emit_uint32(data, key->opt.prefix_len);
+				break;
+
+			case P4ENGINE_EXACT:
+				flipEndianness(key->value, key->value_size);
+				std::memcpy(data, key->value, key->value_size);
+				data += key->value_size;
+				break;
+			}
+
+			key = key->next;
+		}
+
+		// Our actions are always direct
+		data += emit_action_entry_type(data, PI_ACTION_ENTRY_TYPE_DATA);
+		auto actionProperties = actionMap.at(rule->action);
+
+		data += emit_p4_id(data, actionProperties.id);
+		data += emit_uint32(data, actionProperties.size);
+		data = dumpActionData(info, data, actionProperties.id, rule->params);
+
+		data += emit_uint32(data, 0);  // properties
+		data += emit_uint32(data, 0);  // TODO(antonin): direct resources
+	}
+
+	return PI_STATUS_SUCCESS;
 }
 
-pi_status_t _pi_table_entries_fetch_done(pi_session_handle_t session_handle,
-                                         pi_table_fetch_res_t *res) {
-  _BM_UNUSED(session_handle);
+//! Need to be called after a pi_table_entries_fetch, once you wish the memory
+//! to be released.
+pi_status_t _pi_table_entries_fetch_done(pi_session_handle_t session_handle, pi_table_fetch_res_t *res) {
+	(void) session_handle;
+	Logger::debug("PI_table_entries_fetch_done");
+	
+	delete[] res->entries;
 
-  delete[] res->entries;
-  return PI_STATUS_SUCCESS;
+	return PI_STATUS_SUCCESS;
 }
 
 }
