@@ -14,7 +14,7 @@ src/common.cpp \
 src/action_helpers.h \
 src/action_helpers.cpp \
 src/direct_res_spec.h \
-src/direct_res_spec.cpp
+src/direct_res_spec.cpp \
 src/helpers.hpp \
 src/helpers.cpp \
 src/logger.hpp \
