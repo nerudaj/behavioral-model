@@ -23,7 +23,7 @@ src/devices.cpp
 
 libbmpi_la_LIBADD = \
 $(top_builddir)/src/bm_sim/libbmsim.la \
--lp4dev -lnfb
+-lp4dev -lnfb -lfdt
 
 lib_LTLIBRARIES = libbmpi.la
 
